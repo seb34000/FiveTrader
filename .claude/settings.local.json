@@ -1,0 +1,35 @@
+{
+  "env": {
+    "DRY_RUN": "true",
+    "LOG_LEVEL": "debug"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(go run main.go --dry-run*)",
+      "Bash(go run main.go --strategy * --dry-run*)",
+      "Bash(go version:*)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:clob.polymarket.com)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(go mod:*)",
+      "Bash(go list:*)",
+      "Bash(govulncheck ./...)",
+      "Bash(go run:*)",
+      "Bash(go get:*)",
+      "Bash(go build:*)",
+      "Bash(timeout 15 ./fivetrader --sim)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(gtimeout 15 ./fivetrader --sim)",
+      "Bash(nslookup ws-feed.exchange.coinbase.com)",
+      "Bash(/usr/local/go/bin/go test:*)",
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(xargs -0 ls -lh)"
+    ]
+  },
+  "sandbox": {
+    "enabled": false,
+    "autoAllowBashIfSandboxed": false
+  },
+  "_note": "Gitignored. Overrides personnels pour dev local."
+}
