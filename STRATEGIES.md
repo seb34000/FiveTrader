@@ -56,9 +56,11 @@ Dans ce cas, le marché UP est **sous-évalué** : les traders ne savent pas enc
 ```
 delta = (prix_live - prix_oracle) / prix_oracle
 
-Si delta > +0.3%  →  acheter UP   (BTC monté, oracle en retard)
-Si delta < -0.3%  →  acheter DOWN (BTC baissé, oracle en retard)
+Si delta > +0.15%  →  acheter UP   (BTC monté, oracle en retard)
+Si delta < -0.15%  →  acheter DOWN (BTC baissé, oracle en retard)
 ```
+
+> `MinLagThreshold = 0.0015` dans `strategy/oracle_lag.go:12`.
 
 ### Conditions de validité
 
@@ -76,29 +78,31 @@ Les 5–45 secondes entre le mouvement réel du BTC et la mise à jour de l'orac
 
 ---
 
-## Stratégie 2 — Window Delta T-30s ⭐⭐
+## Stratégie 2 — Window Delta T-60s ⭐⭐
 
 **Win rate estimé : 55–62%.**
 
 ### Le principe
 
-À **30 secondes avant la clôture** d'une fenêtre, la direction est quasi-décidée.
+À **60 secondes avant la clôture** d'une fenêtre, la direction est quasi-décidée.
 Le delta depuis l'ouverture de la fenêtre est le signal le plus prédictif.
 
 ```
 window_open = prix BTC au début de la fenêtre (toutes les 5 min)
 delta = (prix_actuel - window_open) / window_open
 
-Si BTC a monté de +0.1% depuis l'ouverture → BET UP  (si token UP < $0.72)
-Si BTC a baissé de -0.1% depuis l'ouverture → BET DOWN (si token DOWN < $0.72)
+Si BTC a monté de +0.1% depuis l'ouverture → BET UP  (si token UP < $0.78)
+Si BTC a baissé de -0.1% depuis l'ouverture → BET DOWN (si token DOWN < $0.78)
 ```
+
+> `WindowDeltaEntryT = 240.0` et `MaxEntryTokenPrice = 0.78` dans `strategy/window_delta.go:12-13`.
 
 ### Fenêtre d'entrée
 
 ```
 Fenêtre ouverte à T=0s
-├── T=0 à T=270s  → surveiller, ne pas entrer encore
-├── T=270s (T-30s) → ENTRÉE POSSIBLE  ← on commence à chercher
+├── T=0 à T=240s  → surveiller, ne pas entrer encore
+├── T=240s (T-60s) → ENTRÉE POSSIBLE  ← on commence à chercher
 ├── T=292s (T-8s)  → DERNIÈRE ENTRÉE  ← trop tard ensuite (gas Polygon)
 └── T=300s         → EXPIRATION
 ```
@@ -112,7 +116,7 @@ Fenêtre ouverte à T=0s
 | ~0.20% | ~80% | ~$0.65 |
 | ~0.30% | ~92% | ~$0.75 |
 
-On n'entre que si le token coûte **moins de $0.72** — cela garantit un edge positif.
+On n'entre que si le token coûte **moins de $0.78** — cela garantit un edge positif.
 
 ### Pourquoi ça marche
 
@@ -147,9 +151,12 @@ Le bot **achète un nombre égal de tokens** sur les deux côtés simultanément
 ### Signal d'entrée
 
 ```
-Si askUP + askDOWN < $0.96 → arbitrage déclenché
+Si askUP + askDOWN < $0.98 → arbitrage déclenché
 PnL = budget × (1 / sum − 1)   ← toujours positif quand sum < 1
 ```
+
+> `MaxSumForArb = 0.98` dans `strategy/dump_hedge.go:7`.
+> ⚠ À 0.98 brut, les fees Polymarket (~200 bps) mangent ~2% d'edge — revoir si non rentable.
 
 ### Exemple (sizing token-based)
 

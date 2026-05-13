@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -17,10 +18,31 @@ const (
 	ModeLive               // real money trading
 )
 
+// TradeFilters holds entry-price, position-size, and drawdown guardrails.
+// These values are loaded from environment variables and passed to the risk manager.
+type TradeFilters struct {
+	// Price band: skip trades outside [MinEntryPrice, MaxEntryPrice].
+	// oracle_lag bypasses MaxEntryPrice; dump_hedge bypasses both.
+	MinEntryPrice float64 // default 0.60
+	MaxEntryPrice float64 // default 0.90
+
+	// Position limits
+	MaxPositionSize float64 // max tokens (shares) per trade; default no cap
+	MaxLossPerTrade float64 // max USDC staked per trade; default no cap
+
+	// Consecutive-loss pause: stop trading for PauseDuration after MaxConsecLosses losses in a row.
+	MaxConsecLosses int           // default 3
+	PauseDuration   time.Duration // default 30 min
+
+	// Per-window gating: max 1 trade per asset per 5-min window (enforced by Coordinator).
+	MaxTradesPerWindow int // default 1
+}
+
 type Config struct {
 	// Wallet
-	PrivateKey string
-	Address    string // derived from private key
+	PrivateKey  string
+	Address     string // derived from private key
+	ProxyWallet string // optional: Polymarket proxy wallet (POLY_PROXY_WALLET)
 
 	// Polymarket API credentials
 	PolyAPIKey        string
@@ -49,6 +71,14 @@ type Config struct {
 	// if the DOWN leg fails after the UP leg fills (cancel is a no-op on filled FOK).
 	// Set ENABLE_DUMP_HEDGE_LIVE=true only when atomic two-leg submission is available.
 	EnableDumpHedgeLive bool
+
+	// SlippageTicks is the number of 0.01 ticks added to the ask price when placing FOK
+	// orders to absorb orderbook staleness (~1-2s between poll and CLOB submission).
+	// Default 1 (= +$0.01). Set 0 to disable, 2 for volatile markets.
+	SlippageTicks int
+
+	// Trade filters: entry-price band, position caps, consecutive-loss pause.
+	Filters TradeFilters
 }
 
 // IsDryRun returns true for dry-run mode (backward compat helper).
@@ -73,6 +103,7 @@ func Load() (*Config, error) {
 
 	c := &Config{
 		PrivateKey:        mustEnv("PRIVATE_KEY"),
+		ProxyWallet:       os.Getenv("POLY_PROXY_WALLET"),
 		PolyAPIKey:        os.Getenv("POLY_API_KEY"),
 		PolyAPISecret:     os.Getenv("POLY_API_SECRET"),
 		PolyAPIPassphrase: os.Getenv("POLY_API_PASSPHRASE"),
@@ -86,6 +117,16 @@ func Load() (*Config, error) {
 		EnableWindowDelta:   envBool("ENABLE_WINDOW_DELTA", true),
 		EnableDumpHedge:     envBool("ENABLE_DUMP_HEDGE", true),
 		EnableDumpHedgeLive: envBool("ENABLE_DUMP_HEDGE_LIVE", false),
+		SlippageTicks:       envInt("SLIPPAGE_TICKS", 1),
+		Filters: TradeFilters{
+			MinEntryPrice:      envFloat("MIN_ENTRY_PRICE", 0.60),
+			MaxEntryPrice:      envFloat("MAX_ENTRY_PRICE", 0.90),
+			MaxPositionSize:    envFloat("MAX_POSITION_SIZE", 0),    // 0 = no cap
+			MaxLossPerTrade:    envFloat("MAX_LOSS_PER_TRADE", 0), // 0 = disabled; Kelly + MaxBetUSDC already cap size
+			MaxConsecLosses:    envInt("MAX_CONSEC_LOSSES", 3),
+			PauseDuration:      time.Duration(envInt("PAUSE_DURATION_MIN", 30)) * time.Minute,
+			MaxTradesPerWindow: envInt("MAX_TRADES_PER_WINDOW", 1),
+		},
 	}
 
 	// Dry-run and sim don't need API credentials (read-only Polymarket access)

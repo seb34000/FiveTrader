@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "FiveTrader Bot (sim + web)",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", ".", "--sim", "--web"],
+      "port": 8080
+    },
+    {
+      "name": "React Dev Server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "web/react"],
+      "port": 5173
+    }
+  ]
+}

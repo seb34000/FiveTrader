@@ -60,6 +60,7 @@ func connectBitstamp(ctx context.Context, channel string, out chan<- Tick, log *
 		return err
 	}
 	defer conn.Close()
+	go func() { <-ctx.Done(); conn.Close() }()
 
 	sub := map[string]interface{}{
 		"event": "bts:subscribe",
@@ -68,7 +69,7 @@ func connectBitstamp(ctx context.Context, channel string, out chan<- Tick, log *
 	if err := conn.WriteJSON(sub); err != nil {
 		return err
 	}
-	log.Info("bitstamp connected", zap.String("channel", channel))
+	log.Debug("bitstamp connected", zap.String("channel", channel))
 
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPingHandler(func(msg string) error {

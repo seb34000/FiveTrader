@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -29,6 +30,7 @@ func runAssetLoop(
 	a asset.Asset,
 	exec *execution.Executor,
 	rm *risk.Manager,
+	coord *risk.Coordinator,
 	simulator *sim.Simulator,
 	liveJournal *monitor.Journal,
 	ensemble *strategy.Ensemble,
@@ -42,8 +44,8 @@ func runAssetLoop(
 ) {
 	strategyCooldowns := map[string]time.Duration{
 		"dump_hedge":   0,
-		"oracle_lag":   290 * time.Second,
-		"window_delta": 10 * time.Second,
+		"oracle_lag":   20 * time.Second,
+		"window_delta": 5 * time.Second,
 	}
 
 	var (
@@ -63,6 +65,15 @@ func runAssetLoop(
 		lastDiagTime         time.Time
 	)
 
+	// oracleAgeSince returns the age of the oracle price, or 0 if no data has been
+	// received yet. time.Since(time.Time{}) overflows int64 (~2025 years > 290yr max).
+	oracleAgeSince := func() time.Duration {
+		if oraclePrice.UpdatedAt.IsZero() {
+			return 0
+		}
+		return time.Since(oraclePrice.UpdatedAt)
+	}
+
 	pushState := func() {
 		if onState == nil {
 			return
@@ -78,7 +89,7 @@ func runAssetLoop(
 			LivePrice:     livePrice,
 			OraclePrice:   oraclePrice.Value,
 			OracleDelta:   oracleDelta,
-			OracleAge:     time.Since(oraclePrice.UpdatedAt),
+			OracleAge:     oracleAgeSince(),
 			PriceBinance:  priceBinance,
 			PriceBitstamp: priceBitstamp,
 			PriceCoinbase: priceCoinbase,
@@ -126,12 +137,11 @@ func runAssetLoop(
 					} else {
 						windowOpen = livePrice
 					}
-					log.Info("new window",
+					log.Debug("new window",
 						zap.String("asset", a.Symbol),
 						zap.Time("start", ws),
 						zap.Float64("open_price", windowOpen))
 				}
-				monitor.LogPrice(log, livePrice, oraclePrice.Value, time.Since(oraclePrice.UpdatedAt))
 			}
 			pushState()
 
@@ -152,7 +162,7 @@ func runAssetLoop(
 		sctx := &strategy.Context{
 			LivePrice:   livePrice,
 			OraclePrice: oraclePrice.Value,
-			OracleAge:   time.Since(oraclePrice.UpdatedAt),
+			OracleAge:   oracleAgeSince(),
 			Market:      currentMarket,
 			WindowOpen:  windowOpen,
 			Now:         time.Now(),
@@ -162,12 +172,12 @@ func runAssetLoop(
 		if sig == nil {
 			if time.Since(lastDiagTime) >= 30*time.Second {
 				lastDiagTime = time.Now()
-				oracleAge := time.Since(oraclePrice.UpdatedAt).Truncate(time.Second)
+				oracleAge := oracleAgeSince().Truncate(time.Second)
 				oracleDelta := 0.0
 				if oraclePrice.Value > 0 && livePrice > 0 {
 					oracleDelta = (livePrice - oraclePrice.Value) / oraclePrice.Value * 100
 				}
-				log.Info("no signal",
+				log.Debug("no signal",
 					zap.String("asset", a.Symbol),
 					zap.Float64("oracle_delta_pct", oracleDelta),
 					zap.Duration("oracle_age", oracleAge),
@@ -189,19 +199,48 @@ func runAssetLoop(
 			}
 		}
 		monitor.LogSignal(log, sig)
-		lastSignalByStrategy[sig.Strategy] = time.Now()
 		lastSignalDesc = fmt.Sprintf("%s %s edge=%.3f", sig.Strategy, sig.Direction.String(), sig.Edge)
 		pushState()
 
-		result := rm.Approve(sig.Strategy, sig.AskPrice, sig.WinProb, sig.Edge, sig.Confidence)
+		result := rm.Approve(sig.Strategy, sig.AskPrice, sig.WinProb, sig.Edge, sig.Confidence, sig.FeeRateBps)
 		if !result.Approved {
-			log.Info("risk rejected", zap.String("reason", result.Reason))
+			log.Info("trade skipped",
+				zap.String("asset", a.Symbol),
+				zap.String("reason", result.Reason),
+				zap.String("strategy", sig.Strategy),
+				zap.Float64("ask_price", sig.AskPrice),
+			)
 			continue
 		}
+
+		// Cross-asset / per-window guard: max 1 trade per asset per window,
+		// and correlated assets (ETH/XRP) cannot both trade in the same window.
+		if coord != nil {
+			if ok, reason := coord.ReserveWindow(a.Symbol, currentMarket.WindowEnd); !ok {
+				log.Info("trade skipped",
+					zap.String("asset", a.Symbol),
+					zap.String("reason", reason),
+					zap.String("strategy", sig.Strategy),
+					zap.Float64("ask_price", sig.AskPrice),
+				)
+				continue
+			}
+		}
+
 		if !rm.ReserveBet() {
-			log.Info("risk rejected", zap.String("reason", "max concurrent bets (reserved)"))
+			if coord != nil {
+				coord.ReleaseWindow(a.Symbol, currentMarket.WindowEnd)
+			}
+			log.Info("trade skipped",
+				zap.String("asset", a.Symbol),
+				zap.String("reason", "max_concurrent_bets_reserved"),
+				zap.String("strategy", sig.Strategy),
+			)
 			continue
 		}
+		// Set cooldown only after the trade is actually approved and reserved.
+		// Previously set before Approve(), which burned the cooldown even on rejections.
+		lastSignalByStrategy[sig.Strategy] = time.Now()
 		log.Info("executing",
 			zap.String("asset", a.Symbol),
 			zap.String("strategy", sig.Strategy),
@@ -210,19 +249,37 @@ func runAssetLoop(
 		go func(s *strategy.Signal, size float64, winOpen float64, mkt market.State, oraclePx float64) {
 			orderID, err := exec.Execute(ctx, s, size)
 			if err != nil {
-				log.Error("execution failed", zap.String("asset", a.Symbol), zap.Error(err))
 				rm.UnreserveBet()
+				if coord != nil {
+					coord.ReleaseWindow(a.Symbol, mkt.WindowEnd)
+				}
+				if errors.Is(err, execution.ErrOrderKilled) {
+					log.Info("FOK order killed — no liquidity at this price, skipping",
+						zap.String("asset", a.Symbol),
+						zap.String("strategy", s.Strategy),
+						zap.Float64("ask", s.AskPrice),
+					)
+				} else if errors.Is(err, execution.ErrPriceMovedAgainstUs) {
+					log.Info("price moved past strategy cap during latency — skipping",
+						zap.String("asset", a.Symbol),
+						zap.String("strategy", s.Strategy),
+						zap.Float64("signal_ask", s.AskPrice),
+					)
+				} else {
+					log.Error("execution failed", zap.String("asset", a.Symbol), zap.Error(err))
+				}
 				return
 			}
 			trade := &risk.Trade{
-				ID:         orderID,
-				Strategy:   s.Strategy,
-				Direction:  s.Direction.String(),
-				TokenID:    s.TokenID,
-				USDCStaked: size,
-				TokenPrice: s.AskPrice,
-				Timestamp:  time.Now(),
-				WindowEnd:  mkt.WindowEnd,
+				ID:          orderID,
+				Strategy:    s.Strategy,
+				Direction:   s.Direction.String(),
+				TokenID:     s.TokenID,
+				ConditionID: mkt.ConditionID,
+				USDCStaked:  size,
+				TokenPrice:  s.AskPrice,
+				Timestamp:   time.Now(),
+				WindowEnd:   mkt.WindowEnd,
 			}
 			rm.OpenTrade(trade)
 			if liveJournal != nil {

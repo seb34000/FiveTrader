@@ -8,9 +8,9 @@ import (
 const (
 	NameWindowDelta = "window_delta"
 
-	MinWindowDelta       = 0.001 // 0.1% minimum window delta to act
-	MaxEntryTokenPrice   = 0.78  // don't enter if token already > 0.78
-	WindowDeltaEntryT    = 240.0 // earliest entry at T-60s (240s elapsed)
+	MinWindowDelta       = 0.0007 // 0.07% minimum window delta to act
+	MaxEntryTokenPrice   = 0.82   // don't enter if token already > 0.82
+	WindowDeltaEntryT    = 180.0  // earliest entry at T-120s (180s elapsed)
 	WindowDeltaLastEntry = 292.0 // latest entry at T-8s
 )
 
@@ -126,6 +126,8 @@ func (s *WindowDelta) Evaluate(ctx *Context) *Signal {
 		WinProb:     winProb,
 		Edge:        edge,
 		Confidence:  confidence,
+		NegRisk:     ctx.Market.NegRisk,
+		FeeRateBps:  ctx.Market.FeeRateBps,
 		GeneratedAt: ctx.Now,
 	}
 }

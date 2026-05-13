@@ -68,7 +68,8 @@ func aggregate(sources map[string]*sourceState) AggregatedPrice {
 	var prices []float64
 
 	for name, s := range sources {
-		if now.Sub(s.updatedAt) > staleDuration {
+		age := now.Sub(s.updatedAt)
+		if age > staleDuration {
 			continue // ignore stale sources
 		}
 		prices = append(prices, s.price)

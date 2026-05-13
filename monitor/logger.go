@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,21 +14,40 @@ import (
 )
 
 // NewLogger creates a structured zap logger.
-// Debug level is enabled in non-live modes for visibility.
-func NewLogger(mode config.Mode) (*zap.Logger, error) {
+// All levels (DEBUG+) go to stderr. If errLogPath is non-empty, WARN+ are also
+// written to that file in JSON format (one entry per line, append mode).
+func NewLogger(_ config.Mode, errLogPath string) (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
 	cfg.EncoderConfig.TimeKey = "ts"
 	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	cfg.EncoderConfig.EncodeDuration = zapcore.StringDurationEncoder
-	if mode != config.ModeLive {
-		cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+
+	base, err := cfg.Build()
+	if err != nil {
+		return nil, err
 	}
-	return cfg.Build()
+	if errLogPath == "" {
+		return base, nil
+	}
+
+	f, err := os.OpenFile(errLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open error log: %w", err)
+	}
+	fileCore := zapcore.NewCore(
+		zapcore.NewJSONEncoder(cfg.EncoderConfig),
+		zapcore.AddSync(f),
+		zap.NewAtomicLevelAt(zap.WarnLevel),
+	)
+	return base.WithOptions(zap.WrapCore(func(c zapcore.Core) zapcore.Core {
+		return zapcore.NewTee(c, fileCore)
+	})), nil
 }
 
 // LogSignal logs a strategy signal at INFO level.
 func LogSignal(log *zap.Logger, sig *strategy.Signal) {
-	log.Info("signal generated",
+	log.Debug("signal generated",
 		zap.String("strategy", sig.Strategy),
 		zap.String("direction", sig.Direction.String()),
 		zap.Float64("ask", sig.AskPrice),
@@ -40,7 +60,7 @@ func LogSignal(log *zap.Logger, sig *strategy.Signal) {
 // LogStats logs a periodic P&L summary.
 func LogStats(log *zap.Logger, rm *risk.Manager) {
 	trades, pnl, winRate := rm.DailyStats()
-	log.Info("daily stats",
+	log.Debug("daily stats",
 		zap.Int("trades", trades),
 		zap.String("pnl", fmt.Sprintf("$%.2f", pnl)),
 		zap.String("win_rate", fmt.Sprintf("%.1f%%", winRate*100)),

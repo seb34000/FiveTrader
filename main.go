@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/seb/fivetrader/asset"
 	"github.com/seb/fivetrader/config"
@@ -87,6 +90,8 @@ func main() {
 		force    = flag.Bool("force", false, "Skip LIVE mode confirmation prompt")
 		webMode  = flag.Bool("web", false, "Enable web dashboard")
 		webPort  = flag.Int("web-port", 8080, "Port for the web dashboard")
+		webHost  = flag.String("web-host", "127.0.0.1", "Bind address for the web dashboard (use 0.0.0.0 to expose publicly)")
+		webAuth  = flag.String("web-auth", "", "Basic Auth credentials for web dashboard (format: user:password)")
 		assets   = flag.String("assets", "btc,eth,xrp", "Comma-separated list of assets to trade")
 	)
 	flag.Parse()
@@ -106,17 +111,24 @@ func main() {
 		cfg.Mode = config.ModeLive
 	}
 
-	log, err := monitor.NewLogger(cfg.Mode)
-	if err != nil {
-		panic(err)
-	}
-	defer log.Sync()
-
 	modeLabel := map[config.Mode]string{
 		config.ModeDryRun: "DRY-RUN",
 		config.ModeSim:    "SIM",
 		config.ModeLive:   "LIVE",
 	}[cfg.Mode]
+
+	// Create session directory early so the error log path is available for the logger.
+	sessionDir := filepath.Join("sessions", fmt.Sprintf("%s_%s", time.Now().Format("20060102_150405"), strings.ToLower(modeLabel)))
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create session directory %s: %v\n", sessionDir, err)
+		os.Exit(1)
+	}
+
+	log, err := monitor.NewLogger(cfg.Mode, filepath.Join(sessionDir, "errors.log"))
+	if err != nil {
+		panic(err)
+	}
+	defer log.Sync()
 
 	switch cfg.Mode {
 	case config.ModeDryRun:
@@ -130,7 +142,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	exec, err := execution.NewExecutor(cfg.PrivateKey, cfg.Mode, cfg.EnableDumpHedgeLive, log)
+	exec, err := execution.NewExecutor(cfg.PrivateKey, cfg.Mode, cfg.EnableDumpHedgeLive, cfg.SlippageTicks, log)
 	if err != nil {
 		log.Fatal("executor init failed", zap.Error(err))
 	}
@@ -141,6 +153,26 @@ func main() {
 		exec.Address(), log,
 	)
 	exec.SetCLOBClient(clobClient)
+
+	// Proxy wallet: use POLY_PROXY_WALLET if set, otherwise auto-detect from CLOB.
+	// Required for trading with funds deposited via the Polymarket UI (signatureType=1).
+	if cfg.Mode == config.ModeLive {
+		pw := cfg.ProxyWallet
+		if pw == "" {
+			fetched, err := clobClient.FetchProxyWallet(ctx)
+			if err != nil {
+				log.Warn("could not auto-detect proxy wallet — falling back to EOA signing (signatureType=0)",
+					zap.Error(err),
+					zap.String("hint", "set POLY_PROXY_WALLET in .env to use Polymarket-deposited funds"),
+				)
+			} else {
+				pw = fetched
+			}
+		}
+		if pw != "" {
+			exec.SetProxyWallet(pw)
+		}
+	}
 
 	if cfg.Mode == config.ModeLive && !*force {
 		strategies := fmt.Sprintf("oracle_lag=%v window_delta=%v dump_hedge=%v (live=%v)",
@@ -175,12 +207,31 @@ func main() {
 	}
 	log.Info("active assets", zap.Int("count", len(activeAssets)))
 
+	log.Debug("session directory", zap.String("path", sessionDir))
+
 	state := &botState{}
 	state.init(modeLabel, exec.Address())
 
 	ensemble := strategy.NewEnsemble(cfg.EnableOracleLag, cfg.EnableWindowDelta, cfg.EnableDumpHedge)
 
+	// Shared cross-asset coordinator: one-trade-per-window. Correlation guard disabled —
+	// MaxConcurrentBets + MaxDailyLoss already cap aggregate risk across assets.
+	coord := risk.NewCoordinator(cfg.Filters.MaxTradesPerWindow, [][]string{})
+
+	// Shared wallet balance: polled every 60s in live mode, init'd to MaxBetUSDC as fallback.
+	walletBalanceBits := new(atomic.Uint64)
+	walletBalanceBits.Store(math.Float64bits(cfg.MaxBetUSDC))
+
 	var wg sync.WaitGroup
+
+	// Wallet balance poller: syncs live USDC balance into walletBalanceBits every 60s (live only).
+	if cfg.Mode == config.ModeLive {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runWalletBalancePoller(ctx, cfg.PolygonRPC, exec.Address(), walletBalanceBits, 60*time.Second, log)
+		}()
+	}
 
 	// Launch one set of goroutines per asset
 	for _, a := range activeAssets {
@@ -200,28 +251,36 @@ func main() {
 			MaxDailyLossUSDC:  cfg.MaxDailyLossUSDC,
 			MaxConcurrentBets: cfg.MaxConcurrentBets,
 			KellyFraction:     cfg.KellyFraction,
-		}, log)
+			Filters: risk.FilterConfig{
+				MinEntryPrice:   cfg.Filters.MinEntryPrice,
+				MaxEntryPrice:   cfg.Filters.MaxEntryPrice,
+				MaxPositionSize: cfg.Filters.MaxPositionSize,
+				MaxLossPerTrade: cfg.Filters.MaxLossPerTrade,
+				MaxConsecLosses: cfg.Filters.MaxConsecLosses,
+				PauseDuration:   cfg.Filters.PauseDuration,
+			},
+		}, walletBalanceBits, log)
 
 		// Sim setup (per-asset)
 		var simulator *sim.Simulator
 		if cfg.Mode == config.ModeSim {
-			journalPath := fmt.Sprintf("sim_journal_%s_%s.jsonl", a.Symbol, time.Now().Format("20060102_150405"))
+			journalPath := filepath.Join(sessionDir, fmt.Sprintf("sim_%s.jsonl", a.Symbol))
 			simulator, err = sim.NewSimulator(&livePriceBits, &oraclePriceBits, journalPath, log)
 			if err != nil {
 				log.Fatal("sim init failed", zap.String("asset", a.Symbol), zap.Error(err))
 			}
-			log.Info("sim journal opened", zap.String("asset", a.Symbol), zap.String("path", journalPath))
+			log.Debug("sim journal opened", zap.String("asset", a.Symbol), zap.String("path", journalPath))
 		}
 
 		// Live journal (per-asset)
 		var liveJournal *monitor.Journal
 		if cfg.Mode == config.ModeLive {
-			journalPath := fmt.Sprintf("trade_journal_%s_%s.jsonl", a.Symbol, time.Now().Format("20060102_150405"))
+			journalPath := filepath.Join(sessionDir, fmt.Sprintf("trades_%s.jsonl", a.Symbol))
 			liveJournal, err = monitor.NewJournal(journalPath)
 			if err != nil {
 				log.Fatal("live journal init failed", zap.String("asset", a.Symbol), zap.Error(err))
 			}
-			log.Info("live journal opened", zap.String("asset", a.Symbol), zap.String("path", journalPath))
+			log.Debug("live journal opened", zap.String("asset", a.Symbol), zap.String("path", journalPath))
 		}
 
 		// Price feeds
@@ -246,7 +305,7 @@ func main() {
 		wg.Add(1)
 		go func(rm *risk.Manager, simulator *sim.Simulator) {
 			defer wg.Done()
-			runSettlementLoop(ctx, rm, simulator, log)
+			runSettlementLoop(ctx, rm, clobClient, simulator, log)
 		}(rm, simulator)
 
 		// Periodic stats
@@ -274,7 +333,7 @@ func main() {
 		go func(rm *risk.Manager, simulator *sim.Simulator, liveJournal *monitor.Journal) {
 			defer wg.Done()
 			runAssetLoop(
-				ctx, a, exec, rm, simulator, liveJournal, ensemble,
+				ctx, a, exec, rm, coord, simulator, liveJournal, ensemble,
 				&livePriceBits, &oraclePriceBits,
 				prices, oraclePrices, marketStates,
 				func(as ui.AssetState) { state.setAsset(as) },
@@ -289,7 +348,7 @@ func main() {
 				if err := simulator.Close(); err != nil {
 					log.Warn("journal close error", zap.String("asset", sym), zap.Error(err))
 				}
-				log.Info("journal saved", zap.String("asset", sym), zap.String("path", simulator.JournalPath()))
+				log.Debug("journal saved", zap.String("asset", sym), zap.String("path", simulator.JournalPath()))
 			} else {
 				monitor.LogStats(log, rm)
 			}
@@ -297,13 +356,20 @@ func main() {
 				if err := liveJournal.Close(); err != nil {
 					log.Warn("live journal close error", zap.String("asset", sym), zap.Error(err))
 				}
-				log.Info("live journal saved", zap.String("asset", sym), zap.String("path", liveJournal.Path()))
+				log.Debug("live journal saved", zap.String("asset", sym), zap.String("path", liveJournal.Path()))
 			}
 		}(a.Symbol, rm, simulator, liveJournal)
 	}
 
-	// Web dashboard
-	webDashboard(webMode, webPort, state, log, ctx)
+	// Web dashboard: create LogHub, tee into logger, start server
+	var logHub *web.LogHub
+	if *webMode {
+		logHub = web.NewLogHub()
+		log = log.WithOptions(zap.WrapCore(func(inner zapcore.Core) zapcore.Core {
+			return web.NewLogCore(inner, logHub)
+		}))
+	}
+	webDashboard(webMode, webPort, webHost, webAuth, state, logHub, log, ctx)
 	
 	// Wait for shutdown signal and graceful shutdown
 	shutdownAndWait(cancel, &wg, log)
@@ -312,18 +378,29 @@ func main() {
 	log.Sync()
 }
 
-func webDashboard(webMode *bool, webPort *int, state *botState, log *zap.Logger, ctx context.Context) {
+func webDashboard(webMode *bool, webPort *int, webHost *string, webAuth *string, state *botState, logHub *web.LogHub, log *zap.Logger, ctx context.Context) {
 	// Web dashboard + state pusher
 	if *webMode {
 		webHub := web.NewHub()
 		go webHub.Run()
-		srv := web.NewServer(*webPort, webHub, ".")
+
+		var authUser, authPass string
+		if *webAuth != "" {
+			parts := strings.SplitN(*webAuth, ":", 2)
+			if len(parts) == 2 {
+				authUser, authPass = parts[0], parts[1]
+			}
+		}
+		srv := web.NewServer(*webPort, webHub, logHub, ".", *webHost, authUser, authPass)
 		go func() {
 			if err := srv.Run(ctx); err != nil {
 				log.Warn("web server stopped", zap.Error(err))
 			}
 		}()
-		log.Info("web dashboard started", zap.Int("port", *webPort))
+		log.Info("web dashboard started",
+			zap.String("addr", fmt.Sprintf("%s:%d", *webHost, *webPort)),
+			zap.Bool("auth", authUser != ""),
+		)
 	
 		// Push merged state to hub every 500ms
 		go func() {
@@ -360,3 +437,4 @@ func shutdownAndWait(cancel context.CancelFunc, wg *sync.WaitGroup, log *zap.Log
 		log.Warn("shutdown timeout")
 	}
 }
+

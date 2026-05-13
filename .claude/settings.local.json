@@ -24,7 +24,13 @@
       "Bash(/usr/local/go/bin/go test:*)",
       "Bash(wc:*)",
       "Bash(python3:*)",
-      "Bash(xargs -0 ls -lh)"
+      "Bash(xargs -0 ls -lh)",
+      "Bash(npm install:*)",
+      "Bash(go test:*)",
+      "Bash(pip show:*)",
+      "Bash(pip3 show:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(/usr/local/go/bin/go build *)"
     ]
   },
   "sandbox": {

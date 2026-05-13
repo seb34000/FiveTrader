@@ -1,9 +1,11 @@
 package risk
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seb/fivetrader/strategy"
@@ -11,14 +13,28 @@ import (
 )
 
 const (
-	MinEdge          = 0.02 // minimum 2% edge to trade
+	MinEdge          = 0.015 // minimum 1.5% edge to trade
 	MinEdgeDumpHedge = 0.01 // dump_hedge is risk-free; only needs marginal edge > 0
-	MinTokenPrice    = 0.35 // don't buy tokens below 0.35
-	MaxTokenPrice    = 0.75 // don't buy tokens above 0.75 (except oracle lag)
 
 	stratOracleLag = strategy.NameOracleLag
 	stratDumpHedge = strategy.NameDumpHedge
 )
+
+// FilterConfig holds entry-price, position-size, and consecutive-loss guardrails.
+type FilterConfig struct {
+	// Price band: trades outside [MinEntryPrice, MaxEntryPrice] are rejected.
+	// oracle_lag bypasses MaxEntryPrice; dump_hedge bypasses both (its AskPrice = sum of two legs).
+	MinEntryPrice float64 // default 0.60
+	MaxEntryPrice float64 // default 0.90
+
+	// Position limits per trade.
+	MaxPositionSize float64 // max tokens (shares) per trade; 0 = no cap
+	MaxLossPerTrade float64 // max USDC staked per trade; 0 = no cap
+
+	// Consecutive-loss pause.
+	MaxConsecLosses int           // trigger after this many consecutive losses; 0 = disabled
+	PauseDuration   time.Duration // how long to pause; default 30 min
+}
 
 // Config holds risk parameters loaded from application config.
 type Config struct {
@@ -26,7 +42,13 @@ type Config struct {
 	MaxDailyLossUSDC  float64
 	MaxConcurrentBets int
 	KellyFraction     float64
+	Filters           FilterConfig
 }
+
+// PnLLookup resolves the actual P&L for a settled trade by querying the market.
+// Returns (pnl, resolved, err). resolved=false means the market has not settled yet;
+// the trade will be retried on the next settlement tick.
+type PnLLookup func(ctx context.Context, conditionID, direction string, usdcStaked, tokenPrice float64) (pnl float64, resolved bool, err error)
 
 // Trade records a single trade outcome.
 type Trade struct {
@@ -34,6 +56,7 @@ type Trade struct {
 	Strategy    string
 	Direction   string
 	TokenID     string
+	ConditionID string    // Polymarket condition ID for resolution lookup
 	USDCStaked  float64
 	TokenPrice  float64
 	Timestamp   time.Time
@@ -46,27 +69,77 @@ const maxRecentTrades = 50
 
 // Manager enforces risk rules and sizes positions.
 type Manager struct {
-	cfg          Config
-	mu           sync.Mutex
-	dailyLoss    float64
-	dailySettled int
-	dailyPnL     float64
-	dailyWins    int
-	dailyWinRate float64
-	openTrades   map[string]*Trade
-	recentTrades []Trade // last maxRecentTrades settled, oldest first
-	reservedBets int     // slots reserved before goroutine launch (prevents TOCTOU race)
-	dayStart     time.Time
-	log          *zap.Logger
+	cfg              Config
+	mu               sync.Mutex
+	walletBalanceBits *atomic.Uint64 // shared across per-asset Managers; read lock-free in Approve
+	dailyLoss        float64
+	dailySettled     int
+	dailyPnL         float64
+	dailyWins        int
+	dailyWinRate     float64
+	openTrades       map[string]*Trade
+	recentTrades     []Trade // last maxRecentTrades settled, oldest first
+	reservedBets     int     // slots reserved before goroutine launch (prevents TOCTOU race)
+	dayStart         time.Time
+	pauseUntil       time.Time // non-zero when in consecutive-loss cooldown
+	log              *zap.Logger
 }
 
 // NewManager creates a Manager with the given risk configuration.
-func NewManager(cfg Config, log *zap.Logger) *Manager {
+// walletBalanceBits is a shared atomic holding the live USDC balance as float64 bits.
+// Pass nil to allocate a private atomic initialised to cfg.MaxBetUSDC (tests / sim / dry-run).
+// Zero values in FilterConfig are replaced with safe defaults.
+func NewManager(cfg Config, walletBalanceBits *atomic.Uint64, log *zap.Logger) *Manager {
+	// Apply defaults for FilterConfig so zero-value configs behave sensibly.
+	if cfg.Filters.MinEntryPrice <= 0 {
+		cfg.Filters.MinEntryPrice = 0.50
+	}
+	if cfg.Filters.MaxEntryPrice <= 0 {
+		cfg.Filters.MaxEntryPrice = 0.92
+	}
+	if cfg.Filters.MaxLossPerTrade <= 0 {
+		cfg.Filters.MaxLossPerTrade = math.MaxFloat64 // no cap
+	}
+	if cfg.Filters.MaxPositionSize <= 0 {
+		cfg.Filters.MaxPositionSize = math.MaxFloat64 // no cap
+	}
+	if cfg.Filters.MaxConsecLosses <= 0 {
+		cfg.Filters.MaxConsecLosses = 3
+	}
+	if cfg.Filters.PauseDuration <= 0 {
+		cfg.Filters.PauseDuration = 30 * time.Minute
+	}
+	if walletBalanceBits == nil {
+		walletBalanceBits = new(atomic.Uint64)
+		walletBalanceBits.Store(math.Float64bits(cfg.MaxBetUSDC))
+	}
 	return &Manager{
-		cfg:        cfg,
-		openTrades: make(map[string]*Trade),
-		dayStart:   today(),
-		log:        log,
+		cfg:               cfg,
+		walletBalanceBits: walletBalanceBits,
+		openTrades:        make(map[string]*Trade),
+		dayStart:          today(),
+		log:               log,
+	}
+}
+
+// SetBalance updates the shared wallet balance (called by the background poller in live mode).
+func (m *Manager) SetBalance(usdc float64) {
+	m.walletBalanceBits.Store(math.Float64bits(usdc))
+}
+
+// Balance returns the current wallet balance in USDC (atomic read, safe to call from any goroutine).
+func (m *Manager) Balance() float64 {
+	return math.Float64frombits(m.walletBalanceBits.Load())
+}
+
+// adjustBalance adds delta to the wallet balance using a CAS loop (safe under concurrent Store from poller).
+func (m *Manager) adjustBalance(delta float64) {
+	for {
+		old := m.walletBalanceBits.Load()
+		next := math.Float64bits(math.Float64frombits(old) + delta)
+		if m.walletBalanceBits.CompareAndSwap(old, next) {
+			return
+		}
 	}
 }
 
@@ -80,7 +153,8 @@ type ApproveResult struct {
 // Approve checks risk rules and returns Kelly-sized bet amount.
 // strategy is the strategy name (oracle_lag bypasses MaxTokenPrice).
 // confidence (0–1) from the signal scales the Kelly fraction: lower confidence = smaller position.
-func (m *Manager) Approve(strategy string, tokenPrice, winProb, edge, confidence float64) ApproveResult {
+// feeRateBps is the taker fee in basis points (200 = 2%); deducted from net odds inside Kelly.
+func (m *Manager) Approve(strategy string, tokenPrice, winProb, edge, confidence float64, feeRateBps int64) ApproveResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -95,12 +169,23 @@ func (m *Manager) Approve(strategy string, tokenPrice, winProb, edge, confidence
 		return ApproveResult{Reason: fmt.Sprintf("edge %.3f < min %.3f", edge, minEdge)}
 	}
 
-	// Rule: token price bounds
-	if tokenPrice < MinTokenPrice {
-		return ApproveResult{Reason: fmt.Sprintf("price %.3f < min %.3f", tokenPrice, MinTokenPrice)}
+	// Rule: consecutive-loss pause
+	if !m.pauseUntil.IsZero() && time.Now().Before(m.pauseUntil) {
+		return ApproveResult{Reason: "consec_loss_pause"}
 	}
-	if tokenPrice > MaxTokenPrice && strategy != stratOracleLag && strategy != stratDumpHedge {
-		return ApproveResult{Reason: fmt.Sprintf("price %.3f > max %.3f", tokenPrice, MaxTokenPrice)}
+
+	// Rule: token price bounds.
+	// dump_hedge AskPrice = sum of both legs (> 0.90 in practice) — bypass both bounds.
+	// oracle_lag bypasses both MinEntryPrice and MaxEntryPrice: it specifically targets
+	// tokens at 0.50–0.60 that haven't priced in the lag yet (best entries) and high-
+	// conviction near-certainties up to 0.92.
+	if strategy != stratDumpHedge && strategy != stratOracleLag {
+		if tokenPrice < m.cfg.Filters.MinEntryPrice {
+			return ApproveResult{Reason: fmt.Sprintf("price_below_min (%.3f < %.3f)", tokenPrice, m.cfg.Filters.MinEntryPrice)}
+		}
+		if tokenPrice > m.cfg.Filters.MaxEntryPrice {
+			return ApproveResult{Reason: fmt.Sprintf("price_above_max (%.3f > %.3f)", tokenPrice, m.cfg.Filters.MaxEntryPrice)}
+		}
 	}
 
 	// Rule: concurrent bets (open + reserved slots to prevent TOCTOU race)
@@ -115,9 +200,18 @@ func (m *Manager) Approve(strategy string, tokenPrice, winProb, edge, confidence
 
 	// Kelly sizing: f* = (p*(b+1) - 1) / b
 	// where p = win probability, b = net odds (1/price - 1)
-	netOdds := (1.0 / tokenPrice) - 1.0
+	// Fees are deducted from profit, so effective net odds shrink by (1 - feeRate).
+	// Without this, a 2% raw edge (~MinEdge) is fully consumed by ~200bps Polymarket taker fees.
+	feeRate := float64(feeRateBps) / 10000.0
+	if feeRate < 0 {
+		feeRate = 0
+	}
+	if feeRate >= 1 {
+		return ApproveResult{Reason: fmt.Sprintf("fee rate %.4f >= 1 (token price=%.3f)", feeRate, tokenPrice)}
+	}
+	netOdds := ((1.0 / tokenPrice) - 1.0) * (1.0 - feeRate)
 	if netOdds <= 0 {
-		return ApproveResult{Reason: fmt.Sprintf("net odds <= 0 (token price=%.3f)", tokenPrice)}
+		return ApproveResult{Reason: fmt.Sprintf("net odds <= 0 after fees (token price=%.3f, fee=%.4f)", tokenPrice, feeRate)}
 	}
 	kellyFull := (winProb*(netOdds+1) - 1) / netOdds
 	if kellyFull <= 0 {
@@ -126,9 +220,26 @@ func (m *Manager) Approve(strategy string, tokenPrice, winProb, edge, confidence
 	conf := math.Min(math.Max(confidence, 0), 1.0) // clamp [0,1]
 	kellySize := kellyFull * m.cfg.KellyFraction * conf
 
-	usdcSize := kellySize * m.cfg.MaxBetUSDC
-	usdcSize = math.Min(usdcSize, m.cfg.MaxBetUSDC)
+	// Conviction multiplier: scale position size by price-band confidence tier.
+	// Bypassed for dump_hedge (sum of two legs, semantically different) and oracle_lag
+	// (which already encodes confidence via its own confidence field — applying convictionScale
+	// would double-count the price signal and make sub-$1 bets at 0.50–0.62 entries).
+	if strategy != stratDumpHedge && strategy != stratOracleLag {
+		kellySize *= convictionScale(tokenPrice)
+	}
+
+	walletUSDC := math.Float64frombits(m.walletBalanceBits.Load())
+	usdcSize := kellySize * walletUSDC
+	usdcSize = math.Min(usdcSize, m.cfg.MaxBetUSDC) // hard cap regardless of wallet size
 	usdcSize = math.Min(usdcSize, m.cfg.MaxDailyLossUSDC-m.dailyLoss)
+
+	// Per-trade caps: max USDC staked and max shares.
+	usdcSize = math.Min(usdcSize, m.cfg.Filters.MaxLossPerTrade)
+	if m.cfg.Filters.MaxPositionSize < math.MaxFloat64 {
+		maxByShares := m.cfg.Filters.MaxPositionSize * tokenPrice
+		usdcSize = math.Min(usdcSize, maxByShares)
+	}
+
 	usdcSize = math.Floor(usdcSize*100) / 100 // round to cents
 
 	if usdcSize < 1.0 {
@@ -170,6 +281,7 @@ func (m *Manager) OpenTrade(t *Trade) {
 		m.reservedBets--
 	}
 	m.openTrades[t.ID] = t
+	m.adjustBalance(-t.USDCStaked) // debit stake from local balance immediately
 	m.log.Info("trade opened",
 		zap.String("id", t.ID),
 		zap.String("strategy", t.Strategy),
@@ -204,12 +316,15 @@ func (m *Manager) SettleTrade(id string, pnl float64) {
 	if len(m.recentTrades) > maxRecentTrades {
 		m.recentTrades = m.recentTrades[len(m.recentTrades)-maxRecentTrades:]
 	}
+	m.adjustBalance(t.USDCStaked + pnl) // credit payout: stake+profit on win, 0 on loss
 	delete(m.openTrades, id)
 	m.log.Info("trade settled",
 		zap.String("id", id),
 		zap.Float64("pnl", pnl),
 		zap.Float64("daily_loss", m.dailyLoss),
+		zap.Float64("wallet_balance", m.Balance()),
 	)
+	m.checkConsecLosses()
 }
 
 // DailyStats returns summary statistics for today.
@@ -233,30 +348,111 @@ func (m *Manager) resetDayIfNeeded() {
 }
 
 // SettleExpiredTrades settles open trades whose window has expired (+ 30s grace).
-// In production, this should query the CLOB API for actual P&L.
-// For now, we mark them settled with 0 P&L to unblock the concurrent bets counter.
-func (m *Manager) SettleExpiredTrades(log *zap.Logger) {
+// lookup queries Polymarket for the actual market outcome.
+//
+// Failure handling — never settle as $0 (neutral). On Polymarket binary markets, an
+// expired position is either won or lost — never neutral. Settling at $0 understates
+// dailyLoss (circuit breaker won't trigger) and inflates dailyWinRate.
+//
+//   - lookup error before 10min grace → defer (transient network blip; retry next tick).
+//   - lookup error after 10min grace  → settle as -USDCStaked (assume worst case).
+//   - market unresolved before 10min  → defer (Polymarket Gamma is slow but consistent).
+//   - market unresolved after 10min   → settle as -USDCStaked (force-close to free slot).
+//   - no lookup / no conditionID      → settle as -USDCStaked (config bug; fail safe).
+func (m *Manager) SettleExpiredTrades(ctx context.Context, lookup PnLLookup, log *zap.Logger) {
+	// Collect expired trades under lock (avoid holding lock during network calls).
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	now := time.Now()
-	for id, t := range m.openTrades {
-		if t.WindowEnd.IsZero() || now.Before(t.WindowEnd.Add(30*time.Second)) {
+	var expired []*Trade
+	for _, t := range m.openTrades {
+		if !t.WindowEnd.IsZero() && now.After(t.WindowEnd.Add(30*time.Second)) {
+			expired = append(expired, t)
+		}
+	}
+	m.mu.Unlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	// Resolve each trade's P&L outside the lock (may involve network calls).
+	type settlement struct {
+		id  string
+		pnl float64
+	}
+	var toSettle []settlement
+	for _, t := range expired {
+		past10min := now.After(t.WindowEnd.Add(10 * time.Minute))
+		// No resolver / no conditionID — config bug. Fail safe by booking the loss.
+		if lookup == nil || t.ConditionID == "" {
+			log.Warn("no P&L resolver / conditionID — settling as loss (-stake)",
+				zap.String("id", t.ID), zap.Float64("usdc_staked", t.USDCStaked),
+				zap.Time("window_end", t.WindowEnd))
+			toSettle = append(toSettle, settlement{id: t.ID, pnl: -t.USDCStaked})
 			continue
 		}
-		// Assume worst case — settle as total loss so the circuit breaker triggers correctly.
-		// Conservative: better to stop early than to trade past the daily loss limit.
-		log.Warn("auto-settling expired trade as loss (actual P&L unknown — check CLOB manually)",
-			zap.String("id", id),
-			zap.Time("window_end", t.WindowEnd),
-			zap.Float64("assumed_loss", -t.USDCStaked),
-		)
+		actual, resolved, err := lookup(ctx, t.ConditionID, t.Direction, t.USDCStaked, t.TokenPrice)
+		if err != nil {
+			if past10min {
+				log.Warn("P&L lookup failed past 10min grace — settling as loss (-stake)",
+					zap.String("id", t.ID), zap.Float64("usdc_staked", t.USDCStaked), zap.Error(err))
+				toSettle = append(toSettle, settlement{id: t.ID, pnl: -t.USDCStaked})
+			} else {
+				log.Info("P&L lookup failed (transient) — deferring settlement",
+					zap.String("id", t.ID), zap.Error(err))
+			}
+			continue
+		}
+		if !resolved {
+			if past10min {
+				log.Warn("market still unresolved 10min after expiry — force-settling as loss (-stake)",
+					zap.String("id", t.ID), zap.Float64("usdc_staked", t.USDCStaked),
+					zap.Time("window_end", t.WindowEnd))
+				toSettle = append(toSettle, settlement{id: t.ID, pnl: -t.USDCStaked})
+			} else {
+				log.Info("market not yet resolved — deferring settlement", zap.String("id", t.ID))
+			}
+			continue
+		}
+		toSettle = append(toSettle, settlement{id: t.ID, pnl: actual})
+	}
+
+	if len(toSettle) == 0 {
+		return
+	}
+
+	// Apply settlements under lock.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range toSettle {
+		t, ok := m.openTrades[s.id]
+		if !ok {
+			continue // already settled concurrently
+		}
 		t.Settled = true
-		t.PnL = -t.USDCStaked
-		m.dailyLoss += t.USDCStaked
+		t.PnL = s.pnl
+		if s.pnl < 0 {
+			m.dailyLoss += -s.pnl
+		}
 		m.dailySettled++
-		m.dailyPnL += t.PnL
+		m.dailyPnL += s.pnl
+		if s.pnl > 0 {
+			m.dailyWins++
+		}
 		m.dailyWinRate = float64(m.dailyWins) / float64(m.dailySettled)
-		delete(m.openTrades, id)
+		m.recentTrades = append(m.recentTrades, *t)
+		if len(m.recentTrades) > maxRecentTrades {
+			m.recentTrades = m.recentTrades[len(m.recentTrades)-maxRecentTrades:]
+		}
+		m.adjustBalance(t.USDCStaked + s.pnl) // credit payout: stake+profit on win, 0 on loss
+		delete(m.openTrades, s.id)
+		log.Info("trade settled",
+			zap.String("id", s.id),
+			zap.Float64("pnl", s.pnl),
+			zap.Float64("daily_loss", m.dailyLoss),
+			zap.Float64("wallet_balance", m.Balance()),
+		)
+		m.checkConsecLosses()
 	}
 }
 
@@ -310,6 +506,48 @@ func (m *Manager) Snapshot() Snapshot {
 		OpenTrades:   open,
 		RecentTrades: recent,
 	}
+}
+
+// convictionScale returns a Kelly multiplier based on token price tier.
+// Higher price tokens represent higher-conviction signals and receive more capital.
+// Applies to window_delta; dump_hedge and oracle_lag are exempted.
+//
+//	≥ 0.70 → 1.0  (full conviction)
+//	≥ 0.62 → 0.6  (moderate conviction)
+//	default → 0.3  (low conviction, 0.60–0.61 band)
+func convictionScale(tokenPrice float64) float64 {
+	switch {
+	case tokenPrice >= 0.70:
+		return 1.0
+	case tokenPrice >= 0.62:
+		return 0.6
+	default:
+		return 0.3
+	}
+}
+
+// checkConsecLosses inspects the recent settled-trade ring and activates a cooldown
+// pause if the last MaxConsecLosses trades are all losses.
+// Must be called under m.mu.
+func (m *Manager) checkConsecLosses() {
+	n := m.cfg.Filters.MaxConsecLosses
+	if n <= 0 || len(m.recentTrades) < n {
+		return
+	}
+	// Use PnL >= 0 (not > 0): a neutral $0 settle is not a loss. Without this guard,
+	// the legacy SettleExpiredTrades $0 fallback (now removed) caused spurious cooldowns.
+	// Only n consecutive STRICT losses (PnL < 0) trigger the pause.
+	for i := len(m.recentTrades) - n; i < len(m.recentTrades); i++ {
+		if m.recentTrades[i].PnL >= 0 {
+			return // at least one non-loss — no pause
+		}
+	}
+	// All last n trades are strict losses.
+	m.pauseUntil = time.Now().Add(m.cfg.Filters.PauseDuration)
+	m.log.Warn("consecutive loss pause activated",
+		zap.Int("consec_losses", n),
+		zap.Time("resume_at", m.pauseUntil),
+	)
 }
 
 // today returns midnight UTC of the current day.

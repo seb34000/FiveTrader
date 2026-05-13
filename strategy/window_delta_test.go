@@ -70,7 +70,7 @@ func TestWindowDelta_Signal_Down(t *testing.T) {
 }
 
 func TestWindowDelta_NoSignal_TooEarly(t *testing.T) {
-	ctx := baseWindowDeltaCtx(100) // elapsed < 240s
+	ctx := baseWindowDeltaCtx(100) // elapsed < WindowDeltaEntryT (180s)
 	ctx.LivePrice = 85000.0
 	ctx.WindowOpen = 84700.0 // large delta
 
@@ -80,14 +80,14 @@ func TestWindowDelta_NoSignal_TooEarly(t *testing.T) {
 	}
 }
 
-func TestWindowDelta_Signal_AtT60(t *testing.T) {
-	ctx := baseWindowDeltaCtx(245) // elapsed=245s, just past entry at T-60s (240s)
+func TestWindowDelta_Signal_AtEntryWindow(t *testing.T) {
+	ctx := baseWindowDeltaCtx(185) // elapsed=185s, just past entry at T-120s (180s)
 	ctx.LivePrice = 85000.0
 	ctx.WindowOpen = 84700.0 // delta ~+0.354% → should fire
 
 	sig := (&WindowDelta{}).Evaluate(ctx)
 	if sig == nil {
-		t.Fatal("expected signal at T-60s (elapsed=245s)")
+		t.Fatal("expected signal at T-120s (elapsed=185s)")
 	}
 	if sig.Direction != DirectionUp {
 		t.Errorf("Direction = %v, want Up", sig.Direction)
@@ -108,7 +108,7 @@ func TestWindowDelta_NoSignal_TooLate(t *testing.T) {
 func TestWindowDelta_NoSignal_DeltaTooSmall(t *testing.T) {
 	ctx := baseWindowDeltaCtx(280)
 	ctx.LivePrice = 85000.0
-	ctx.WindowOpen = 84999.0 // delta ~0.001% < 0.1%
+	ctx.WindowOpen = 84999.0 // delta ~0.001% < MinWindowDelta (0.07%)
 
 	sig := (&WindowDelta{}).Evaluate(ctx)
 	if sig != nil {
@@ -120,7 +120,7 @@ func TestWindowDelta_NoSignal_TokenTooExpensive(t *testing.T) {
 	ctx := baseWindowDeltaCtx(280)
 	ctx.LivePrice = 85000.0
 	ctx.WindowOpen = 84700.0
-	ctx.Market.AskUp = 0.80 // > 0.72 max
+	ctx.Market.AskUp = 0.83 // > MaxEntryTokenPrice (0.82)
 
 	sig := (&WindowDelta{}).Evaluate(ctx)
 	if sig != nil {
@@ -189,11 +189,12 @@ func TestWindowDelta_TimeFactor_LaterIsHigher(t *testing.T) {
 }
 
 func TestWindowDelta_TimeFactor_AtLastEntry_IsAboutEightPercent(t *testing.T) {
-	// At window start (elapsed=240), timeFactor=1.0; at T-8s (elapsed=292), timeFactor=1.08.
-	// Formula: 1.0 + 0.08*(elapsed-240)/(292-240)
+	// At entry window start (elapsed=WindowDeltaEntryT=180), timeFactor=1.0;
+	// at T-8s (elapsed=292), timeFactor=1.08.
+	// Formula: 1.0 + 0.08*(elapsed-WindowDeltaEntryT)/(292-WindowDeltaEntryT)
 	// Use delta = exactly 0.1% so deltaToWinProb returns 0.80 — no ceiling hit before or after.
 	// live=85000, windowOpen=84915 → delta=(85000-84915)/84915≈0.001
-	ctxEarly := baseWindowDeltaCtx(240)
+	ctxEarly := baseWindowDeltaCtx(180) // exactly at WindowDeltaEntryT → timeFactor=1.0
 	ctxLate := baseWindowDeltaCtx(292)
 	ctxEarly.WindowOpen = 84915.0
 	ctxLate.WindowOpen = 84915.0
@@ -205,7 +206,7 @@ func TestWindowDelta_TimeFactor_AtLastEntry_IsAboutEightPercent(t *testing.T) {
 	}
 	ratio := sigLate.WinProb / sigEarly.WinProb
 	if ratio < 1.07 || ratio > 1.09 {
-		t.Errorf("late/early winProb ratio = %.4f, want ~1.08 (8%% boost at T-8s vs window start)", ratio)
+		t.Errorf("late/early winProb ratio = %.4f, want ~1.08 (8%% boost at T-8s vs entry window start)", ratio)
 	}
 }
 

@@ -58,6 +58,7 @@ func connectCoinbase(ctx context.Context, productID string, out chan<- Tick, log
 		return err
 	}
 	defer conn.Close()
+	go func() { <-ctx.Done(); conn.Close() }()
 
 	sub := coinbaseSubMsg{
 		Type:       "subscribe",
@@ -67,7 +68,7 @@ func connectCoinbase(ctx context.Context, productID string, out chan<- Tick, log
 	if err := conn.WriteJSON(sub); err != nil {
 		return err
 	}
-	log.Info("coinbase connected", zap.String("product", productID))
+	log.Debug("coinbase connected", zap.String("product", productID))
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	conn.SetPingHandler(func(msg string) error {

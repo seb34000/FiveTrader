@@ -39,6 +39,7 @@ type Signal struct {
 	Edge         float64   // WinProb - AskPrice
 	Confidence   float64   // signal confidence [0,1]
 	NegRisk      bool      // true if market uses NegRisk CTF exchange
+	FeeRateBps   int64     // taker fee rate in bps — must match EIP-712 signature
 	GeneratedAt  time.Time
 }
 

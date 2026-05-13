@@ -172,18 +172,18 @@ func TestOracleLag_NoSignal_NoTokenID(t *testing.T) {
 
 func TestOracleLag_WinProbAt_MinDelta(t *testing.T) {
 	ctx := baseOracleLagCtx()
-	// delta exactly at minLagThreshold 0.15%
-	// Formula: 0.72 + min(0.0015/0.008, 1)*0.20 = 0.72 + 0.1875*0.20 = 0.7575
+	// delta exactly at minLagThreshold 0.10%
+	// Formula: 0.62 + min(0.0010/0.008, 1)*0.16 = 0.62 + 0.125*0.16 = 0.64
 	ctx.LivePrice = 85000.0
-	ctx.OraclePrice = 85000.0 / 1.0015 // exactly +0.15%
+	ctx.OraclePrice = 85000.0 / 1.0010 // exactly +0.10%
 
 	s := &OracleLag{}
 	sig := s.Evaluate(ctx)
 	if sig == nil {
 		t.Fatal("expected signal at min delta threshold")
 	}
-	if sig.WinProb < 0.73 || sig.WinProb > 0.80 {
-		t.Errorf("WinProb = %v, want in [0.73, 0.80] at min delta", sig.WinProb)
+	if sig.WinProb < 0.62 || sig.WinProb > 0.68 {
+		t.Errorf("WinProb = %v, want in [0.62, 0.68] at min delta", sig.WinProb)
 	}
 }
 
@@ -207,23 +207,24 @@ func TestOracleLag_Signal_AtLowerThreshold(t *testing.T) {
 
 func TestOracleLag_WinProbAt_HighDelta(t *testing.T) {
 	ctx := baseOracleLagCtx()
-	// delta >= 1% → winProb should be 0.92
+	// delta >= 0.8% → winProb should be capped at 0.78
+	// Formula: 0.62 + min(0.008/0.008, 1)*0.16 = 0.78
 	ctx.LivePrice = 85000.0
-	ctx.OraclePrice = 84100.0 // delta ~+1.07%
+	ctx.OraclePrice = 84100.0 // delta ~+1.07% — above saturation point
 
 	s := &OracleLag{}
 	sig := s.Evaluate(ctx)
 	if sig == nil {
 		t.Fatal("expected signal at high delta")
 	}
-	if sig.WinProb < 0.91 || sig.WinProb > 0.93 {
-		t.Errorf("WinProb = %v, want ~0.92 at >=1%% delta", sig.WinProb)
+	if sig.WinProb < 0.77 || sig.WinProb > 0.79 {
+		t.Errorf("WinProb = %v, want ~0.78 at >=0.8%% delta", sig.WinProb)
 	}
 }
 
 func TestOracleLag_NoSignal_NegativeEdge(t *testing.T) {
 	ctx := baseOracleLagCtx()
-	// delta ~+0.354%: winProb = 0.72 + min(0.00354/0.008, 1)*0.20 = 0.72 + 0.4425*0.20 ≈ 0.809
+	// delta ~+0.354%: winProb = 0.62 + min(0.00354/0.008, 1)*0.16 = 0.62 + 0.4425*0.16 ≈ 0.691
 	// Set ask = 0.85 < 0.92 max but > winProb → no edge
 	ctx.LivePrice = 85000.0
 	ctx.OraclePrice = 84700.0
@@ -231,7 +232,7 @@ func TestOracleLag_NoSignal_NegativeEdge(t *testing.T) {
 
 	sig := (&OracleLag{}).Evaluate(ctx)
 	if sig != nil {
-		t.Errorf("expected nil when edge <= 0 (ask=0.85 > winProb~0.809), got signal with WinProb=%.3f AskPrice=%.3f", sig.WinProb, sig.AskPrice)
+		t.Errorf("expected nil when edge <= 0 (ask=0.85 > winProb~0.691), got signal with WinProb=%.3f AskPrice=%.3f", sig.WinProb, sig.AskPrice)
 	}
 }
 

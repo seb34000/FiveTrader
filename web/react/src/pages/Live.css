@@ -1,0 +1,203 @@
+/* Countdown */
+.countdown-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.countdown-num {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.countdown-bar-wrap {
+  width: 100%;
+  height: 4px;
+  background: var(--bg4);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.countdown-bar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.5s linear, background 0.3s;
+}
+
+.countdown-label {
+  font-size: 11px;
+}
+
+/* Price feeds */
+.price-feeds {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.price-feed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.price-feed-label {
+  font-size: 12px;
+  width: 70px;
+  flex-shrink: 0;
+}
+
+.price-feed-val {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Oracle delta */
+.oracle-delta-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.oracle-delta-val {
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.oracle-delta-label {
+  font-size: 11px;
+}
+
+.oracle-age {
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+/* Market prices */
+.market-prices {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.market-price-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.market-price-side {
+  font-size: 11px;
+  font-weight: 700;
+  width: 40px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-align: center;
+}
+
+.market-price-side.up {
+  background: rgba(63,185,80,.15);
+  color: var(--green);
+}
+
+.market-price-side.down {
+  background: rgba(248,81,73,.15);
+  color: var(--red);
+}
+
+.market-price-ask {
+  font-size: 16px;
+  font-weight: 700;
+  flex: 1;
+}
+
+.market-price-payout {
+  font-size: 12px;
+}
+
+.market-price-divider {
+  font-size: 12px;
+  padding-left: 6px;
+}
+
+.market-price-sum {
+  font-size: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+}
+
+/* ── Signal Conditions ── */
+.cond-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+@media (max-width: 1100px) { .cond-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 700px)  { .cond-grid { grid-template-columns: 1fr; } }
+
+.cond-strat {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color var(--transition);
+}
+
+.cond-strat-ready {
+  border-color: var(--green2);
+  background: rgba(35,134,54,.08);
+  box-shadow: 0 0 0 1px rgba(63,185,80,.2);
+}
+
+.cond-strat-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cond-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.cond-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.cond-dot.ok { background: var(--green); }
+.cond-dot.no { background: var(--red); }
+
+.cond-label {
+  flex: 1;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.cond-value {
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cond-detail {
+  font-size: 10px;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}

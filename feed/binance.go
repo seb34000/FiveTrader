@@ -13,6 +13,7 @@ import (
 
 type binanceTrade struct {
 	EventType string `json:"e"`
+	EventTime int64  `json:"E"` // explicit mapping prevents case-insensitive collision with "e"
 	Price     string `json:"p"`
 	Quantity  string `json:"q"`
 	TradeTime int64  `json:"T"`
@@ -52,7 +53,8 @@ func connectBinance(ctx context.Context, wsURL, pair string, out chan<- Tick, lo
 		return err
 	}
 	defer conn.Close()
-	log.Info("binance connected", zap.String("pair", pair))
+	go func() { <-ctx.Done(); conn.Close() }()
+	log.Debug("binance connected", zap.String("pair", pair))
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	conn.SetPongHandler(func(string) error {

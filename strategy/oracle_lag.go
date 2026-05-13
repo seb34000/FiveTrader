@@ -9,8 +9,8 @@ import (
 const (
 	NameOracleLag = "oracle_lag"
 
-	MinLagThreshold        = 0.0015            // 0.15% minimum price deviation to act
-	MinLagAge              = 3 * time.Second   // ignore if oracle just updated (lag already closing)
+	MinLagThreshold        = 0.0010            // 0.10% minimum price deviation to act
+	MinLagAge              = 2 * time.Second   // ignore if oracle just updated (lag already closing)
 	MaxLagAge              = 120 * time.Second // ignore if oracle too stale (data unreliable)
 	MaxTokenPriceOracleLag = 0.92             // oracle lag allows higher entry
 )
@@ -21,6 +21,17 @@ const (
 // the Polymarket market is mispriced. Bet in the direction of
 // the live price before the oracle catches up.
 type OracleLag struct{}
+
+// oracleLagWinProb returns a conservative win probability estimate as a function
+// of |delta|. Range: 0.62 (at threshold) → 0.78 (at ≥0.8% delta).
+//
+// Rationale: oracle-lag arbitrage has structural edge, but market participants
+// partly pre-price the lag. 0.62-0.78 is defensible without backtested data;
+// it keeps Kelly bet sizes safe even if the true win rate is 5-8 pp lower.
+// Recalibrate against --sim journal once ≥200 oracle_lag trades are logged.
+func oracleLagWinProb(absDelta float64) float64 {
+	return 0.62 + math.Min(absDelta/0.008, 1.0)*0.16
+}
 
 // Name returns the strategy identifier.
 func (s *OracleLag) Name() string { return NameOracleLag }
@@ -46,10 +57,12 @@ func (s *OracleLag) DiagnoseNil(ctx *Context) string {
 		return fmt.Sprintf("delta_too_small:%.3f%%", absDelta*100)
 	}
 	if ctx.WindowOpen > 0 {
-		if delta > 0 && ctx.LivePrice < ctx.WindowOpen {
+		relDeviation := (ctx.LivePrice - ctx.WindowOpen) / ctx.WindowOpen
+		const windowAlignTolerance = 0.0005
+		if delta > 0 && relDeviation < -windowAlignTolerance {
 			return fmt.Sprintf("direction_mismatch:live=%.0f<window_open=%.0f", ctx.LivePrice, ctx.WindowOpen)
 		}
-		if delta < 0 && ctx.LivePrice > ctx.WindowOpen {
+		if delta < 0 && relDeviation > windowAlignTolerance {
 			return fmt.Sprintf("direction_mismatch:live=%.0f>window_open=%.0f", ctx.LivePrice, ctx.WindowOpen)
 		}
 	}
@@ -65,7 +78,7 @@ func (s *OracleLag) DiagnoseNil(ctx *Context) string {
 	if askPrice > MaxTokenPriceOracleLag {
 		return fmt.Sprintf("ask_too_high:%.3f>%.3f", askPrice, MaxTokenPriceOracleLag)
 	}
-	winProb := 0.72 + math.Min(absDelta/0.008, 1.0)*0.20
+	winProb := oracleLagWinProb(absDelta)
 	edge := winProb - askPrice
 	if edge <= 0 {
 		return fmt.Sprintf("no_edge:winProb=%.3f ask=%.3f", winProb, askPrice)
@@ -98,15 +111,17 @@ func (s *OracleLag) Evaluate(ctx *Context) *Signal {
 		return nil
 	}
 
-	// Direction must align with window_open: bet UP only if BTC is actually
-	// above the window open price, not just above a stale oracle.
-	// Without this guard, a lag inside a downtrend triggers false UP signals.
+	// Direction must broadly align with window_open, with a 0.05% tolerance band.
+	// Without this guard, a lag inside a strong counter-trend triggers false signals.
+	// The tolerance allows entry when live ≈ windowOpen (common early in the window).
 	if ctx.WindowOpen > 0 {
-		if delta > 0 && ctx.LivePrice < ctx.WindowOpen {
-			return nil // lag says UP, but BTC is below window open → wrong direction
+		relDeviation := (ctx.LivePrice - ctx.WindowOpen) / ctx.WindowOpen
+		const windowAlignTolerance = 0.0005 // 0.05%
+		if delta > 0 && relDeviation < -windowAlignTolerance {
+			return nil // lag says UP, but BTC is meaningfully below window open
 		}
-		if delta < 0 && ctx.LivePrice > ctx.WindowOpen {
-			return nil // lag says DOWN, but BTC is above window open → wrong direction
+		if delta < 0 && relDeviation > windowAlignTolerance {
+			return nil // lag says DOWN, but BTC is meaningfully above window open
 		}
 	}
 
@@ -131,11 +146,8 @@ func (s *OracleLag) Evaluate(ctx *Context) *Signal {
 		return nil // market already priced in the lag
 	}
 
-	// Win probability heuristic: larger delta = higher confidence.
-	// At 0.15% delta → ~0.76, at 0.8%+ delta → 0.92.
-	// Starts higher than before to compensate for Polymarket pre-adjusting asks.
 	absDelta := math.Abs(delta)
-	winProb := 0.72 + math.Min(absDelta/0.008, 1.0)*0.20
+	winProb := oracleLagWinProb(absDelta)
 
 	edge := winProb - askPrice
 	if edge <= 0 {
@@ -151,6 +163,8 @@ func (s *OracleLag) Evaluate(ctx *Context) *Signal {
 		WinProb:     winProb,
 		Edge:        edge,
 		Confidence:  confidence,
+		NegRisk:     ctx.Market.NegRisk,
+		FeeRateBps:  ctx.Market.FeeRateBps,
 		GeneratedAt: ctx.Now,
 	}
 }

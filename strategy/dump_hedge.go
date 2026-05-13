@@ -74,6 +74,8 @@ func (s *DumpHedge) Evaluate(ctx *Context) *Signal {
 		WinProb:      1.0, // guaranteed win
 		Edge:         edge,
 		Confidence:   1.0,
+		NegRisk:      ctx.Market.NegRisk,
+		FeeRateBps:   ctx.Market.FeeRateBps,
 		GeneratedAt:  ctx.Now,
 	}
 }

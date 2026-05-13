@@ -405,5 +405,5 @@ func newTestRiskManager() *risk.Manager {
 		MaxDailyLossUSDC:  500.0,
 		MaxConcurrentBets: 10,
 		KellyFraction:     0.25,
-	}, zap.NewNop())
+	}, nil, zap.NewNop())
 }

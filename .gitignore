@@ -1,3 +1,15 @@
 .env
 *.jsonl
+*.log
+trader.pid
 fivetrader
+fivetrader_amd64
+fivetrader_amd64_*
+trade
+trade_test
+tools/
+deploy/
+session_live/
+sessions/
+web/react/node_modules/
+web/static/assets/
